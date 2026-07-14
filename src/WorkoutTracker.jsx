@@ -72,6 +72,7 @@ const TYPES = {
 
 // Newest first. Every change to the app gets an entry here.
 const CHANGELOG = [
+  { date: "Jul 14, 2026", page: "Platform", summary: "Rebuilt as a standalone Vite + React website: added the project scaffold (package.json, vite.config.js, index.html), a localStorage-backed polyfill for the window.storage API this app persists through, and moved Google Fonts loading from an in-CSS @import to a <link> tag in index.html for more reliable loading." },
   { date: "Jun 27, 2026", page: "Nutrition", summary: "Shipped food logging v1: personal food library, custom foods and quick-add, and food-by-food daily logging with serving-size scaling. A day's calories and macros are now summed from logged foods; history shows daily totals that tap to expand into individual foods. Bodyweight stays a separate daily field; older manually-typed days are preserved and flagged \u201cmanual.\u201d" },
   { date: "Jun 27, 2026", page: "Setup", summary: "Added an in-app Food Logging Setup form (in the menu) to capture the v1 decision points, assumptions, and notes; answers save on-device with a copy-to-share summary." },
   { date: "Jun 27, 2026", page: "Home", summary: "Moved the date selector up beside the unit toggle and menu button so all three align with the 'THE LOG' title on one row; matched their heights." },
