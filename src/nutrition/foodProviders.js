@@ -23,6 +23,33 @@
 
 import { uid, todayStr, round } from "../lib/helpers.js";
 
+// Guards every external call with a timeout, so a hung network request
+// (slow/unreachable provider) can't leave the search UI stuck forever —
+// it fails the same way a fast error would, and callers already treat
+// fetch failures as "no results from this source."
+const FETCH_TIMEOUT_MS = 8000;
+function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
+// Query cache (v4 polish): short-TTL in-memory cache for external provider
+// searches, keyed by provider+query. Session-only (resets on reload) — this
+// just absorbs repeat/backspace-retype searches within a sitting, not a
+// durable cache. The personal library's own search is already local/instant
+// and isn't wrapped.
+const QUERY_CACHE_TTL_MS = 3 * 60 * 1000;
+const queryCache = new Map();
+async function withQueryCache(providerId, query, fn) {
+  const key = `${providerId}:${query.trim().toLowerCase()}`;
+  const hit = queryCache.get(key);
+  if (hit && Date.now() - hit.at < QUERY_CACHE_TTL_MS) return hit.results;
+  const results = await fn();
+  queryCache.set(key, { at: Date.now(), results });
+  return results;
+}
+
 export const libraryProvider = {
   id: "library",
   search(query, libraryFoods) {
@@ -90,18 +117,20 @@ export const nutritionixProvider = {
   async search(query) {
     const q = query.trim();
     if (!q) return [];
-    try {
-      const res = await fetch(`/api/nutritionix/instant?query=${encodeURIComponent(q)}`);
-      if (!res.ok) return [];
-      const data = await res.json();
-      return [...(data.branded || []).map(brandedToCanonical), ...(data.common || []).map(commonToStub)];
-    } catch {
-      return []; // proxy unreachable or key not configured yet — no-op gracefully
-    }
+    return withQueryCache("nutritionix", q, async () => {
+      try {
+        const res = await fetchWithTimeout(`/api/nutritionix/instant?query=${encodeURIComponent(q)}`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return [...(data.branded || []).map(brandedToCanonical), ...(data.common || []).map(commonToStub)];
+      } catch {
+        return []; // proxy unreachable or key not configured yet — no-op gracefully
+      }
+    });
   },
   // Resolves full nutrients for a detail-pending ("common") stub.
   async getDetail(stub) {
-    const res = await fetch("/api/nutritionix/nutrients", {
+    const res = await fetchWithTimeout("/api/nutritionix/nutrients", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: stub._query || stub.name }),
@@ -166,14 +195,16 @@ export const usdaProvider = {
   async search(query) {
     const q = query.trim();
     if (!q) return [];
-    try {
-      const res = await fetch(`/api/usda/search?query=${encodeURIComponent(q)}`);
-      if (!res.ok) return [];
-      const data = await res.json();
-      return (data.foods || []).map(usdaToCanonical);
-    } catch {
-      return []; // proxy unreachable or key not configured yet — no-op gracefully
-    }
+    return withQueryCache("usda", q, async () => {
+      try {
+        const res = await fetchWithTimeout(`/api/usda/search?query=${encodeURIComponent(q)}`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return (data.foods || []).map(usdaToCanonical);
+      } catch {
+        return []; // proxy unreachable or key not configured yet — no-op gracefully
+      }
+    });
   },
 };
 
@@ -211,17 +242,19 @@ export const offProvider = {
   async search(query) {
     const q = query.trim();
     if (!q) return [];
-    try {
-      const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=10`;
-      const res = await fetch(url);
-      if (!res.ok) return [];
-      const data = await res.json();
-      return (data.products || [])
-        .filter((p) => p.product_name && p.code)
-        .map(offToCanonical);
-    } catch {
-      return []; // offline or blocked — no-op gracefully
-    }
+    return withQueryCache("off", q, async () => {
+      try {
+        const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=10`;
+        const res = await fetchWithTimeout(url);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return (data.products || [])
+          .filter((p) => p.product_name && p.code)
+          .map(offToCanonical);
+      } catch {
+        return []; // offline or blocked — no-op gracefully
+      }
+    });
   },
 };
 
@@ -305,4 +338,32 @@ export function cacheExternalFood(food, libraryFoods) {
   delete cached._needsDetail;
   delete cached._query;
   return { food: cached, isNew: true };
+}
+
+// Refresh-stale-cache (v4 polish): cached_from_api foods keep growing more
+// out of date the longer they sit unused. This is a best-effort refresh —
+// re-searching by name via the same provider, rather than a precise by-ID
+// lookup — because cacheExternalFood() reassigns a fresh local id at cache
+// time, so the original provider-side id isn't retained. Good enough for a
+// personal tool; the design doc explicitly treats this as optional polish.
+export const STALE_DAYS = 90;
+export function daysSince(dateStr) {
+  if (!dateStr) return Infinity;
+  return Math.floor((Date.now() - new Date(`${dateStr}T00:00:00`).getTime()) / 86400000);
+}
+export function isStale(food) {
+  return food.provenance === "cached_from_api" && daysSince(food.cachedAt) >= STALE_DAYS;
+}
+export async function refreshFood(food) {
+  if (food.source === "nutritionix") {
+    return nutritionixProvider.getDetail({ ...food, _query: food.name });
+  }
+  if (food.source === "usda" || food.source === "off") {
+    const provider = food.source === "usda" ? usdaProvider : offProvider;
+    const results = await provider.search(food.name);
+    const match = results.find((r) => r.name === food.name && (r.brand || null) === (food.brand || null)) || results[0];
+    if (!match) throw new Error(`No current ${food.source === "usda" ? "USDA" : "Open Food Facts"} match found for this food.`);
+    return { ...food, per100: match.per100, servings: match.servings };
+  }
+  throw new Error("This food can't be refreshed from an external source.");
 }

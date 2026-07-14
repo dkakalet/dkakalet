@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
 import { todayStr, uid, round } from "./lib/helpers.js";
-import { searchAllProviders, nutritionixProvider, cacheExternalFood, buildMeal } from "./nutrition/foodProviders.js";
+import { searchAllProviders, nutritionixProvider, cacheExternalFood, buildMeal, refreshFood, isStale, daysSince } from "./nutrition/foodProviders.js";
 
 /* ----------------------------- helpers ----------------------------- */
 
@@ -79,6 +79,7 @@ const tagFor = (f) => (f.source === "meal" ? MEAL_TAG : f.provenance === "live_e
 
 // Newest first. Every change to the app gets an entry here.
 const CHANGELOG = [
+  { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v4 (polish pass): favorites — star any saved food to pin it above your recents; Recent now reflects what you've actually logged lately (most-recently-logged first) instead of most-recently-added to the library; a short in-memory cache absorbs repeat searches so retyping or revisiting a query doesn't re-hit Nutritionix/USDA/Open Food Facts; and cached external foods older than 90 days show a “may be out of date” notice with a one-tap Refresh that re-pulls current macros from the same source. Also hardened all four external calls with an 8-second timeout, so a slow or unreachable provider can no longer leave search stuck on “Searching…” forever — found this while testing the refresh feature against a deliberately-unmocked call." },
   { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v3: search now also fans out to USDA FoodData Central (free verified generics, key required) and Open Food Facts (barcoded/international products, no key needed — called straight from the browser since there's nothing secret to protect), each tagged by origin same as Nutritionix. Added flat meal composites — build a named meal from any mix of library, cached, or live search results (no nesting), see a running total while assembling it, then log it as a single aggregate line exactly like any other food; a “Your meals” list lets you delete ones you no longer want. Meals and cached foods are stored as ordinary canonical foods, so no logging/scaling/display code needed to change to support them." },
   { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v2: search now fans out to Nutritionix (branded + generic foods) alongside your personal library, behind a shared provider interface so both sources return the same canonical food shape and neither is ranked or hidden — each result is tagged by origin. The Nutritionix API key stays server-side behind a small proxy (never shipped to the browser); until a key is configured, search behaves exactly as v1 (library only, no errors shown). Selecting an external result and logging it caches a canonical copy into your library on first use (flagged “cached_from_api”), so it's searchable offline afterward and duplicate cached copies are avoided." },
   { date: "Jul 14, 2026", page: "Platform", summary: "Rebuilt as a standalone Vite + React website: added the project scaffold (package.json, vite.config.js, index.html), a localStorage-backed polyfill for the window.storage API this app persists through, and moved Google Fonts loading from an in-CSS @import to a <link> tag in index.html for more reliable loading." },
@@ -151,6 +152,7 @@ export default function WorkoutTracker() {
   const [logServ, setLogServ] = useState(0);
   const [logQty, setLogQty] = useState("1");
   const [editingDiet, setEditingDiet] = useState(null);
+  const [refreshingFood, setRefreshingFood] = useState(false);
   // nutrition v2/v3: multi-source search (library + Nutritionix + USDA + Open Food Facts)
   const [libResults, setLibResults] = useState([]);
   const [extResults, setExtResults] = useState([]);
@@ -440,6 +442,19 @@ export default function WorkoutTracker() {
     logEntry(food, s.label, s.grams, q);
     closePanels(); setFoodQuery("");
   };
+  const handleRefreshFood = async () => {
+    setRefreshingFood(true);
+    try {
+      const updated = { ...(await refreshFood(logFood)), cachedAt: todayStr() };
+      setData((d) => ({ ...d, foods: d.foods.map((f) => (f.id === logFood.id ? updated : f)) }));
+      setLogFood(updated);
+      setErr("");
+    } catch (e) {
+      setErr(e.message || "Couldn't refresh this food right now.");
+    } finally {
+      setRefreshingFood(false);
+    }
+  };
   const editDiet = (e) => {
     setView("body"); setEditingDiet(e.id); setDate(e.date);
     setLogFood({ id: e.foodId, name: e.food.name, brand: e.food.brand, per100: e.food.per100,
@@ -479,7 +494,40 @@ export default function WorkoutTracker() {
     setEditingDiet(null); setLogFood(food); setLogServ(0); setLogQty("1"); setPanel("log"); setErr("");
   };
 
-  const recentFoods = useMemo(() => [...data.foods].slice(-8).reverse(), [data.foods]);
+  // nutrition v4: favorites + genuine "recently logged" (not just recently
+  // created) foods.
+  const favoriteFoods = useMemo(
+    () => data.foods.filter((f) => f.favorite).sort((a, b) => a.name.localeCompare(b.name)),
+    [data.foods]
+  );
+  const recentFoods = useMemo(() => {
+    const favIds = new Set(favoriteFoods.map((f) => f.id));
+    if (data.diet.length === 0) return [...data.foods].filter((f) => !favIds.has(f.id)).slice(-8).reverse();
+    const seen = new Set();
+    const out = [];
+    for (let i = data.diet.length - 1; i >= 0 && out.length < 8; i--) {
+      const foodId = data.diet[i].foodId;
+      if (seen.has(foodId) || favIds.has(foodId)) continue;
+      seen.add(foodId);
+      const food = data.foods.find((f) => f.id === foodId);
+      if (food) out.push(food);
+    }
+    return out;
+  }, [data.diet, data.foods, favoriteFoods]);
+  const toggleFavorite = (id) =>
+    setData((d) => ({ ...d, foods: d.foods.map((f) => (f.id === id ? { ...f, favorite: !f.favorite } : f)) }));
+  const renderLocalFoodRow = (f) => (
+    <div className="tl-foodrow" key={f.id}>
+      <button className="tl-foodrow-main" onClick={() => openLog(f)}>
+        <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
+        <span className="tl-foodmeta">{Math.round(f.per100.cal)} kcal/100g
+          <span className={"tl-foodtag " + tagFor(f).cls}>{tagFor(f).label}</span>
+        </span>
+      </button>
+      <button className={"tl-star" + (f.favorite ? " on" : "")} aria-label={f.favorite ? "Remove from favorites" : "Add to favorites"}
+        onClick={(e) => { e.stopPropagation(); toggleFavorite(f.id); }}>{f.favorite ? "★" : "☆"}</button>
+    </div>
+  );
 
   // Debounced fan-out to every enabled provider (personal library +
   // Nutritionix + USDA + Open Food Facts) via the shared orchestrator —
@@ -1108,16 +1156,16 @@ export default function WorkoutTracker() {
           <input className="tl-foodsearch" placeholder="Search your foods, Nutritionix, USDA, Open Food Facts…" value={foodQuery}
             onChange={(e) => setFoodQuery(e.target.value)} />
           <div className="tl-foodlist">
-            {foodResults.map((f) => (
-              <button key={f.id} className="tl-foodrow" onClick={() => openLog(f)}>
-                <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
-                <span className="tl-foodmeta">{Math.round(f.per100.cal)} kcal/100g
-                  <span className={"tl-foodtag " + tagFor(f).cls}>{tagFor(f).label}</span>
-                </span>
-              </button>
-            ))}
+            {!foodQuery.trim() && favoriteFoods.length > 0 && (
+              <>
+                <div className="tl-foodgroup-label">Favorites</div>
+                {favoriteFoods.map(renderLocalFoodRow)}
+                {foodResults.length > 0 && <div className="tl-foodgroup-label">Recent</div>}
+              </>
+            )}
+            {foodResults.map(renderLocalFoodRow)}
             {extResults.map((f) => (
-              <button key={f.id} className="tl-foodrow" onClick={() => selectFood(f)} disabled={extResolvingId === f.id}>
+              <button key={f.id} className="tl-foodrow tl-foodrow-btn" onClick={() => selectFood(f)} disabled={extResolvingId === f.id}>
                 <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
                 <span className="tl-foodmeta">
                   {f._needsDetail ? (extResolvingId === f.id ? "Loading…" : "Tap for nutrition info") : `${Math.round(f.per100.cal)} kcal/100g`}
@@ -1126,7 +1174,7 @@ export default function WorkoutTracker() {
               </button>
             ))}
             {extSearching && <div className="tl-nut-none">Searching…</div>}
-            {!extSearching && foodResults.length === 0 && extResults.length === 0 && (
+            {!extSearching && foodResults.length === 0 && extResults.length === 0 && (foodQuery.trim() || favoriteFoods.length === 0) && (
               <div className="tl-nut-none">
                 {foodQuery ? "No matches. Quick-add or create a food below." : "Your library is empty — quick-add or create a food below."}
               </div>
@@ -1154,6 +1202,12 @@ export default function WorkoutTracker() {
               </div>
               {preview && (parseFloat(logQty) > 0) && (
                 <div className="tl-preview">= <b>{Math.round(preview.cal)} kcal</b> · P {Math.round(preview.protein)} · C {Math.round(preview.carbs)} · F {Math.round(preview.fat)} <span className="tl-gram">({Math.round(previewGrams)} g)</span></div>
+              )}
+              {isStale(logFood) && (
+                <div className="tl-stale">
+                  Cached {daysSince(logFood.cachedAt)} days ago — nutrition data may be out of date.
+                  <button className="tl-ghost sm" onClick={handleRefreshFood} disabled={refreshingFood}>{refreshingFood ? "Refreshing…" : "Refresh"}</button>
+                </div>
               )}
               {err && <div className="tl-err">{err}</div>}
               <div className="tl-form-actions">
@@ -1264,7 +1318,7 @@ export default function WorkoutTracker() {
                 {[...mealResults.library, ...mealResults.nutritionix, ...mealResults.usda, ...mealResults.off]
                   .filter((f) => f.source !== "meal")
                   .map((f) => (
-                    <button key={f.id} className="tl-foodrow" onClick={() => addMealComponent(f)}>
+                    <button key={f.id} className="tl-foodrow tl-foodrow-btn" onClick={() => addMealComponent(f)}>
                       <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
                       <span className="tl-foodmeta">
                         {f._needsDetail ? "Tap to add" : `${Math.round(f.per100.cal)} kcal/100g`}
@@ -1496,8 +1550,14 @@ const CSS = `
 .tl-foodsearch{width:100%;font-family:'Inter';font-size:15px;padding:11px 12px;border:1.5px solid var(--line);background:#fff;color:var(--ink);border-radius:0;margin-bottom:10px;}
 .tl-foodsearch:focus{outline:2px solid var(--ink);outline-offset:-1px;border-color:var(--ink);}
 .tl-foodlist{display:flex;flex-direction:column;gap:6px;}
-.tl-foodrow{display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;text-align:left;background:#fff;border:1px solid var(--line);padding:10px 12px;cursor:pointer;border-radius:0;}
+.tl-foodgroup-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#a8aeb6;font-weight:600;padding:6px 2px 0;}
+.tl-foodrow{display:flex;align-items:stretch;width:100%;background:#fff;border:1px solid var(--line);border-radius:0;}
 .tl-foodrow:hover{border-color:var(--body);background:#f3f9f6;}
+.tl-foodrow.tl-foodrow-btn{flex-direction:column;align-items:flex-start;gap:3px;text-align:left;padding:10px 12px;cursor:pointer;}
+.tl-foodrow-main{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px;text-align:left;background:none;border:none;padding:10px 12px;cursor:pointer;font:inherit;color:inherit;}
+.tl-star{flex:0 0 auto;background:none;border:none;border-left:1px solid var(--line);cursor:pointer;font-size:16px;line-height:1;color:#c7ccc7;padding:0 12px;}
+.tl-star:hover{color:#e0a91c;}
+.tl-star.on{color:#e0a91c;}
 .tl-foodname{font-size:14px;font-weight:600;color:var(--ink);}
 .tl-foodbrand{font-weight:400;color:var(--steel);}
 .tl-foodmeta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--steel);font-variant-numeric:tabular-nums;}
@@ -1506,7 +1566,7 @@ const CSS = `
 .tl-foodtag-usda{color:#2742B8;background:#eaeefc;}
 .tl-foodtag-off{color:#D2541A;background:#fbeee6;}
 .tl-foodtag-meal{color:#fff;background:var(--ink);}
-.tl-foodrow:disabled{opacity:.6;cursor:default;}
+.tl-foodrow-btn:disabled{opacity:.6;cursor:default;}
 
 .tl-mealqty{width:52px;font-family:'Inter';font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:0;margin-right:4px;}
 .tl-mealrow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #EDEEED;font-size:13.5px;}
@@ -1526,6 +1586,8 @@ const CSS = `
 .tl-preview{margin-top:12px;font-size:14px;color:var(--ink);}
 .tl-preview b{color:var(--body);font-weight:800;}
 .tl-gram{color:var(--steel);font-size:12px;}
+.tl-stale{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px;font-size:12.5px;color:var(--cardio);}
+.tl-ghost.sm{padding:6px 12px;font-size:12px;}
 .tl-basis{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:12px 0;}
 .tl-basis-label{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--steel);font-weight:600;}
 .tl-basis-note{font-size:12px;color:var(--steel);margin-top:10px;}
