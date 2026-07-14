@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
 import { todayStr, uid, round } from "./lib/helpers.js";
-import { searchAllProviders, nutritionixProvider, cacheExternalFood } from "./nutrition/foodProviders.js";
+import { searchAllProviders, nutritionixProvider, cacheExternalFood, buildMeal } from "./nutrition/foodProviders.js";
 
 /* ----------------------------- helpers ----------------------------- */
 
@@ -64,8 +64,22 @@ const TYPES = {
   body: { label: "Nutrition", desc: "Bodyweight & calorie intake", color: "var(--body)" },
 };
 
+// Origin tags for food search results, keyed by CanonicalFood.source.
+const SOURCE_TAG = {
+  nutritionix: { label: "Nutritionix", cls: "tl-foodtag-nix" },
+  usda: { label: "USDA", cls: "tl-foodtag-usda" },
+  off: { label: "Open Food Facts", cls: "tl-foodtag-off" },
+};
+const LIBRARY_TAG = { label: "Your library", cls: "" };
+const MEAL_TAG = { label: "Meal", cls: "tl-foodtag-meal" };
+// Meals always read as "Meal"; anything already saved locally (custom foods
+// and previously-cached external foods alike) reads as "Your library";
+// only fresh, not-yet-saved search hits show their true source.
+const tagFor = (f) => (f.source === "meal" ? MEAL_TAG : f.provenance === "live_external" ? SOURCE_TAG[f.source] : LIBRARY_TAG);
+
 // Newest first. Every change to the app gets an entry here.
 const CHANGELOG = [
+  { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v3: search now also fans out to USDA FoodData Central (free verified generics, key required) and Open Food Facts (barcoded/international products, no key needed — called straight from the browser since there's nothing secret to protect), each tagged by origin same as Nutritionix. Added flat meal composites — build a named meal from any mix of library, cached, or live search results (no nesting), see a running total while assembling it, then log it as a single aggregate line exactly like any other food; a “Your meals” list lets you delete ones you no longer want. Meals and cached foods are stored as ordinary canonical foods, so no logging/scaling/display code needed to change to support them." },
   { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v2: search now fans out to Nutritionix (branded + generic foods) alongside your personal library, behind a shared provider interface so both sources return the same canonical food shape and neither is ranked or hidden — each result is tagged by origin. The Nutritionix API key stays server-side behind a small proxy (never shipped to the browser); until a key is configured, search behaves exactly as v1 (library only, no errors shown). Selecting an external result and logging it caches a canonical copy into your library on first use (flagged “cached_from_api”), so it's searchable offline afterward and duplicate cached copies are avoided." },
   { date: "Jul 14, 2026", page: "Platform", summary: "Rebuilt as a standalone Vite + React website: added the project scaffold (package.json, vite.config.js, index.html), a localStorage-backed polyfill for the window.storage API this app persists through, and moved Google Fonts loading from an in-CSS @import to a <link> tag in index.html for more reliable loading." },
   { date: "Jun 27, 2026", page: "Nutrition", summary: "Shipped food logging v1: personal food library, custom foods and quick-add, and food-by-food daily logging with serving-size scaling. A day's calories and macros are now summed from logged foods; history shows daily totals that tap to expand into individual foods. Bodyweight stays a separate daily field; older manually-typed days are preserved and flagged \u201cmanual.\u201d" },
@@ -137,11 +151,17 @@ export default function WorkoutTracker() {
   const [logServ, setLogServ] = useState(0);
   const [logQty, setLogQty] = useState("1");
   const [editingDiet, setEditingDiet] = useState(null);
-  // nutrition v2: multi-source search (personal library + Nutritionix)
+  // nutrition v2/v3: multi-source search (library + Nutritionix + USDA + Open Food Facts)
   const [libResults, setLibResults] = useState([]);
   const [extResults, setExtResults] = useState([]);
   const [extSearching, setExtSearching] = useState(false);
   const [extResolvingId, setExtResolvingId] = useState(null);
+  // nutrition v3: flat meal composites
+  const [mealName, setMealName] = useState("");
+  const [mealComponents, setMealComponents] = useState([]); // [{ food, servingLabel, servingGrams, quantity }]
+  const [mealQuery, setMealQuery] = useState("");
+  const [mealResults, setMealResults] = useState({ library: [], nutritionix: [], usda: [], off: [] });
+  const [mealSearching, setMealSearching] = useState(false);
   const [qName, setQName] = useState(""); const [qCal, setQCal] = useState("");
   const [qProt, setQProt] = useState(""); const [qCarb, setQCarb] = useState(""); const [qFat, setQFat] = useState("");
   const [cfName, setCfName] = useState(""); const [cfBrand, setCfBrand] = useState("");
@@ -398,7 +418,10 @@ export default function WorkoutTracker() {
     const entry = makeEntry(food, servingLabel, servingGrams, quantity, editingDiet || undefined);
     setData((d) => ({ ...d, diet: editingDiet ? d.diet.map((e) => (e.id === editingDiet ? entry : e)) : [...d.diet, entry] }));
   };
-  const closePanels = () => { setPanel(null); setLogFood(null); setEditingDiet(null); setLogQty("1"); setLogServ(0); setErr(""); };
+  const closePanels = () => {
+    setPanel(null); setLogFood(null); setEditingDiet(null); setLogQty("1"); setLogServ(0); setErr("");
+    setMealName(""); setMealComponents([]); setMealQuery("");
+  };
 
   const openLog = (food) => { setEditingDiet(null); setLogFood(food); setLogServ(0); setLogQty("1"); setPanel("log"); setErr(""); };
   const doLog = () => {
@@ -407,7 +430,7 @@ export default function WorkoutTracker() {
     // Cache-on-first-use: the first time an external result is actually
     // logged, persist a canonical copy into the personal library.
     let food = logFood;
-    if (food.source !== "library") {
+    if (food.provenance === "live_external") {
       const { food: cached, isNew } = cacheExternalFood(food, data.foods);
       if (isNew) setData((d) => ({ ...d, foods: [...d.foods, cached] }));
       food = cached;
@@ -459,15 +482,16 @@ export default function WorkoutTracker() {
   const recentFoods = useMemo(() => [...data.foods].slice(-8).reverse(), [data.foods]);
 
   // Debounced fan-out to every enabled provider (personal library +
-  // Nutritionix) via the shared orchestrator — one search call, one debounce.
+  // Nutritionix + USDA + Open Food Facts) via the shared orchestrator —
+  // one search call, one debounce.
   useEffect(() => {
     const q = foodQuery.trim();
     if (view !== "body" || !q) { setLibResults([]); setExtResults([]); setExtSearching(false); return; }
     let live = true;
     setExtSearching(true);
     const t = setTimeout(() => {
-      searchAllProviders(q, { libraryFoods: data.foods }).then(({ library, nutritionix }) => {
-        if (live) { setLibResults(library.slice(0, 20)); setExtResults(nutritionix); setExtSearching(false); }
+      searchAllProviders(q, { libraryFoods: data.foods }).then(({ library, nutritionix, usda, off }) => {
+        if (live) { setLibResults(library.slice(0, 20)); setExtResults([...nutritionix, ...usda, ...off]); setExtSearching(false); }
       });
     }, 280);
     return () => { live = false; clearTimeout(t); };
@@ -487,6 +511,60 @@ export default function WorkoutTracker() {
       setExtResolvingId(null);
     }
   };
+
+  /* ---------- nutrition v3: flat meal composites ---------- */
+  const mealsList = useMemo(() => data.foods.filter((f) => f.source === "meal"), [data.foods]);
+  const mealTotals = useMemo(
+    () =>
+      mealComponents.reduce(
+        (a, c) => {
+          const m = scaleMacros(c.food.per100, c.servingGrams * c.quantity);
+          return { cal: a.cal + m.cal, protein: a.protein + m.protein, carbs: a.carbs + m.carbs, fat: a.fat + m.fat };
+        },
+        { cal: 0, protein: 0, carbs: 0, fat: 0 }
+      ),
+    [mealComponents]
+  );
+
+  useEffect(() => {
+    const q = mealQuery.trim();
+    if (panel !== "meal" || !q) {
+      setMealResults({ library: [], nutritionix: [], usda: [], off: [] });
+      setMealSearching(false);
+      return;
+    }
+    let live = true;
+    setMealSearching(true);
+    const t = setTimeout(() => {
+      searchAllProviders(q, { libraryFoods: data.foods }).then((res) => {
+        if (live) { setMealResults(res); setMealSearching(false); }
+      });
+    }, 280);
+    return () => { live = false; clearTimeout(t); };
+  }, [mealQuery, panel, data.foods]);
+
+  const addMealComponent = async (f) => {
+    let food = f;
+    if (f._needsDetail) {
+      try { food = await nutritionixProvider.getDetail(f); }
+      catch (e) { setErr(e.message || "Couldn't load nutrition info for that food."); return; }
+    }
+    const servs = foodServings(food);
+    setMealComponents((rows) => [...rows, { food, servingLabel: servs[0].label, servingGrams: servs[0].grams, quantity: 1 }]);
+    setMealQuery(""); setErr("");
+  };
+  const updateMealQty = (i, qty) => setMealComponents((rows) => rows.map((r, idx) => (idx === i ? { ...r, quantity: qty } : r)));
+  const removeMealComponent = (i) => setMealComponents((rows) => rows.filter((_, idx) => idx !== i));
+  const saveMeal = () => {
+    const name = mealName.trim();
+    if (!name) return setErr("Name the meal.");
+    if (mealComponents.length === 0) return setErr("Add at least one food to the meal.");
+    for (const c of mealComponents) if (!(c.quantity > 0)) return setErr("Each component needs a quantity greater than 0.");
+    const meal = buildMeal(name, mealComponents);
+    setData((d) => ({ ...d, foods: [...d.foods, meal] }));
+    closePanels();
+  };
+  const deleteMeal = (id) => setData((d) => ({ ...d, foods: d.foods.filter((f) => f.id !== id) }));
 
   const showWeight = (kg) => round(fromKg(kg, system), 1);
   const showDist = (km) => (km == null ? null : round(fromKm(km, system), 2));
@@ -1027,13 +1105,15 @@ export default function WorkoutTracker() {
         {/* add food */}
         <section className="tl-card tl-form">
           <div className="tl-setup-qlabel"><b>Add food</b></div>
-          <input className="tl-foodsearch" placeholder="Search your foods and Nutritionix…" value={foodQuery}
+          <input className="tl-foodsearch" placeholder="Search your foods, Nutritionix, USDA, Open Food Facts…" value={foodQuery}
             onChange={(e) => setFoodQuery(e.target.value)} />
           <div className="tl-foodlist">
             {foodResults.map((f) => (
               <button key={f.id} className="tl-foodrow" onClick={() => openLog(f)}>
                 <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
-                <span className="tl-foodmeta">{Math.round(f.per100.cal)} kcal/100g<span className="tl-foodtag">Your library</span></span>
+                <span className="tl-foodmeta">{Math.round(f.per100.cal)} kcal/100g
+                  <span className={"tl-foodtag " + tagFor(f).cls}>{tagFor(f).label}</span>
+                </span>
               </button>
             ))}
             {extResults.map((f) => (
@@ -1041,20 +1121,21 @@ export default function WorkoutTracker() {
                 <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
                 <span className="tl-foodmeta">
                   {f._needsDetail ? (extResolvingId === f.id ? "Loading…" : "Tap for nutrition info") : `${Math.round(f.per100.cal)} kcal/100g`}
-                  <span className="tl-foodtag tl-foodtag-nix">Nutritionix</span>
+                  <span className={"tl-foodtag " + tagFor(f).cls}>{tagFor(f).label}</span>
                 </span>
               </button>
             ))}
-            {extSearching && <div className="tl-nut-none">Searching Nutritionix…</div>}
+            {extSearching && <div className="tl-nut-none">Searching…</div>}
             {!extSearching && foodResults.length === 0 && extResults.length === 0 && (
               <div className="tl-nut-none">
-                {foodQuery ? "No matches. Quick-add or create a custom food below." : "Your library is empty — quick-add or create a food below."}
+                {foodQuery ? "No matches. Quick-add or create a food below." : "Your library is empty — quick-add or create a food below."}
               </div>
             )}
           </div>
           <div className="tl-foodbtns">
             <button className={"tl-chipbtn" + (panel === "quick" ? " on" : "")} onClick={() => { closePanels(); setQName(foodQuery); setPanel("quick"); }}>+ Quick add</button>
             <button className={"tl-chipbtn" + (panel === "create" ? " on" : "")} onClick={() => { closePanels(); setCfName(foodQuery); setPanel("create"); }}>Create custom food</button>
+            <button className={"tl-chipbtn" + (panel === "meal" ? " on" : "")} onClick={() => { closePanels(); setPanel("meal"); }}>Create meal</button>
           </div>
 
           {/* log panel */}
@@ -1145,6 +1226,75 @@ export default function WorkoutTracker() {
                 <button className="tl-add tl-add-body" onClick={createFood}>Save food</button>
                 <button className="tl-ghost" onClick={closePanels}>Cancel</button>
               </div>
+            </div>
+          )}
+
+          {/* create meal panel (flat composite) */}
+          {panel === "meal" && (
+            <div className="tl-subpanel">
+              <div className="tl-setup-qlabel"><b>Create a meal</b> <span className="tl-opt-opt">a flat set of foods — build once, log repeatedly</span></div>
+              <label className="tl-field tl-field-wide"><span>Meal name</span>
+                <input placeholder="e.g. Sunday breakfast" value={mealName} onChange={(e) => setMealName(e.target.value)} /></label>
+
+              {mealComponents.length > 0 && (
+                <table className="tl-table">
+                  <thead><tr><th>Food</th><th>Qty</th><th>Cal</th><th></th></tr></thead>
+                  <tbody>
+                    {mealComponents.map((c, i) => {
+                      const m = scaleMacros(c.food.per100, c.servingGrams * c.quantity);
+                      return (
+                        <tr key={i}>
+                          <td className="tl-strong">{c.food.name}</td>
+                          <td>
+                            <input type="number" inputMode="decimal" className="tl-mealqty" value={c.quantity}
+                              onChange={(e) => updateMealQty(i, parseFloat(e.target.value) || 0)} /> × {c.servingLabel}
+                          </td>
+                          <td>{Math.round(m.cal)}</td>
+                          <td className="tl-rowact"><button onClick={() => removeMealComponent(i)}>✕</button></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+
+              <input className="tl-foodsearch" placeholder="Add a food to this meal…" value={mealQuery}
+                onChange={(e) => setMealQuery(e.target.value)} />
+              <div className="tl-foodlist">
+                {[...mealResults.library, ...mealResults.nutritionix, ...mealResults.usda, ...mealResults.off]
+                  .filter((f) => f.source !== "meal")
+                  .map((f) => (
+                    <button key={f.id} className="tl-foodrow" onClick={() => addMealComponent(f)}>
+                      <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
+                      <span className="tl-foodmeta">
+                        {f._needsDetail ? "Tap to add" : `${Math.round(f.per100.cal)} kcal/100g`}
+                        <span className={"tl-foodtag " + tagFor(f).cls}>{tagFor(f).label}</span>
+                      </span>
+                    </button>
+                  ))}
+                {mealSearching && <div className="tl-nut-none">Searching…</div>}
+              </div>
+
+              {mealComponents.length > 0 && (
+                <div className="tl-preview">Meal total = <b>{Math.round(mealTotals.cal)} kcal</b> · P {Math.round(mealTotals.protein)} · C {Math.round(mealTotals.carbs)} · F {Math.round(mealTotals.fat)}</div>
+              )}
+              {err && <div className="tl-err">{err}</div>}
+              <div className="tl-form-actions">
+                <button className="tl-add tl-add-body" onClick={saveMeal}>Save meal</button>
+                <button className="tl-ghost" onClick={closePanels}>Cancel</button>
+              </div>
+
+              {mealsList.length > 0 && (
+                <div className="tl-subpanel">
+                  <div className="tl-setup-qlabel"><b>Your meals</b></div>
+                  {mealsList.map((m) => (
+                    <div className="tl-mealrow" key={m.id}>
+                      <span>{m.name} <span className="tl-foodmeta">{Math.round(m.per100.cal * m.servings[0].grams / 100)} kcal/meal</span></span>
+                      <button onClick={() => deleteMeal(m.id)}>Delete</button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -1353,7 +1503,15 @@ const CSS = `
 .tl-foodmeta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--steel);font-variant-numeric:tabular-nums;}
 .tl-foodtag{font-family:'Archivo';font-weight:700;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--body);background:#e7f4ef;padding:2px 6px;}
 .tl-foodtag-nix{color:#6A4FB3;background:#f1edfa;}
+.tl-foodtag-usda{color:#2742B8;background:#eaeefc;}
+.tl-foodtag-off{color:#D2541A;background:#fbeee6;}
+.tl-foodtag-meal{color:#fff;background:var(--ink);}
 .tl-foodrow:disabled{opacity:.6;cursor:default;}
+
+.tl-mealqty{width:52px;font-family:'Inter';font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:0;margin-right:4px;}
+.tl-mealrow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #EDEEED;font-size:13.5px;}
+.tl-mealrow button{background:none;border:none;cursor:pointer;font-family:'Inter';font-size:12px;font-weight:600;color:var(--steel);padding:3px 6px;}
+.tl-mealrow button:hover{color:#b3261e;}
 .tl-foodbtns{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .tl-chipbtn{background:none;border:1.5px solid var(--body);color:var(--body);font-family:'Archivo';font-weight:700;font-size:13px;padding:8px 14px;cursor:pointer;border-radius:0;}
 .tl-chipbtn:hover{background:#eef7f3;}

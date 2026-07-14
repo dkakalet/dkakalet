@@ -1,8 +1,8 @@
-// Unified food provider layer (design doc: Nutrition Food Logging — v2).
+// Unified food provider layer (design doc: Nutrition Food Logging — v2/v3).
 //
 // Every source returns the app's existing canonical food shape so the rest
 // of the app (logging, scaling, display) stays source-agnostic:
-//   { id, name, source: 'library' | 'nutritionix', brand,
+//   { id, name, source: 'library' | 'nutritionix' | 'usda' | 'off' | 'meal', brand,
 //     per100: { cal, protein, carbs, fat }, servings: [{ label, grams }],
 //     provenance: 'user_created' | 'cached_from_api' | 'live_external',
 //     verified, createdAt }
@@ -15,6 +15,11 @@
 // exist only for the duration of a search. cacheExternalFood() persists one
 // into the personal library on first use (provenance becomes
 // 'cached_from_api'), per the cache-on-first-use strategy in the design doc.
+//
+// Meals (v3) are flat composites — a named list of {food, quantity}
+// components — but are stored and treated as just another canonical food
+// (source: 'meal'), so logging one reuses the exact same scaling/display
+// code as any other food. See buildMeal() below.
 
 import { uid, todayStr, round } from "../lib/helpers.js";
 
@@ -124,18 +129,163 @@ export const nutritionixProvider = {
   },
 };
 
-const PROVIDERS = [libraryProvider, nutritionixProvider];
+// USDA FoodData Central: unlike Nutritionix, the search endpoint reports
+// nutrients per 100g directly for every food type, so no detail follow-up
+// is needed.
+const USDA_NUTRIENT_NUMBERS = { cal: "208", protein: "203", carbs: "205", fat: "204" };
+function usdaValue(foodNutrients, number) {
+  const hit = (foodNutrients || []).find((n) => n.nutrientNumber === number);
+  return hit ? hit.value || 0 : 0;
+}
+function usdaToCanonical(item) {
+  const servings = [{ label: "100 g", grams: 100 }];
+  if (item.servingSize > 0 && item.servingSizeUnit === "g" && item.servingSize !== 100) {
+    servings.push({ label: `${item.servingSize} ${item.servingSizeUnit}`, grams: item.servingSize });
+  }
+  return {
+    id: `usda:${item.fdcId}`,
+    name: item.description,
+    source: "usda",
+    brand: item.brandOwner || item.brandName || null,
+    per100: {
+      cal: round(usdaValue(item.foodNutrients, USDA_NUTRIENT_NUMBERS.cal), 1),
+      protein: round(usdaValue(item.foodNutrients, USDA_NUTRIENT_NUMBERS.protein), 1),
+      carbs: round(usdaValue(item.foodNutrients, USDA_NUTRIENT_NUMBERS.carbs), 1),
+      fat: round(usdaValue(item.foodNutrients, USDA_NUTRIENT_NUMBERS.fat), 1),
+    },
+    servings,
+    provenance: "live_external",
+    verified: true,
+    createdAt: todayStr(),
+    _needsDetail: false,
+  };
+}
+
+export const usdaProvider = {
+  id: "usda",
+  async search(query) {
+    const q = query.trim();
+    if (!q) return [];
+    try {
+      const res = await fetch(`/api/usda/search?query=${encodeURIComponent(q)}`);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return (data.foods || []).map(usdaToCanonical);
+    } catch {
+      return []; // proxy unreachable or key not configured yet — no-op gracefully
+    }
+  },
+};
+
+// Open Food Facts: free, keyless, public read API with open CORS — called
+// directly from the browser rather than through the proxy, since there's no
+// secret to protect.
+function offToCanonical(product) {
+  const n = product.nutriments || {};
+  const cal = n["energy-kcal_100g"] ?? (n["energy_100g"] != null ? n["energy_100g"] / 4.184 : 0);
+  const servings = [{ label: "100 g", grams: 100 }];
+  if (product.serving_quantity > 0 && product.serving_quantity !== 100) {
+    servings.push({ label: product.serving_size || "serving", grams: product.serving_quantity });
+  }
+  return {
+    id: `off:${product.code}`,
+    name: product.product_name,
+    source: "off",
+    brand: (product.brands || "").split(",")[0].trim() || null,
+    per100: {
+      cal: round(cal || 0, 1),
+      protein: round(n.proteins_100g || 0, 1),
+      carbs: round(n.carbohydrates_100g || 0, 1),
+      fat: round(n.fat_100g || 0, 1),
+    },
+    servings,
+    provenance: "live_external",
+    verified: false,
+    createdAt: todayStr(),
+    _needsDetail: false,
+  };
+}
+
+export const offProvider = {
+  id: "off",
+  async search(query) {
+    const q = query.trim();
+    if (!q) return [];
+    try {
+      const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=10`;
+      const res = await fetch(url);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return (data.products || [])
+        .filter((p) => p.product_name && p.code)
+        .map(offToCanonical);
+    } catch {
+      return []; // offline or blocked — no-op gracefully
+    }
+  },
+};
 
 // Fans out to every enabled provider in parallel and returns results keyed
 // by provider id, each item tagged with its source. No ranking, no
 // cross-source de-duplication — per the design doc, the user sees and
 // chooses between all matches.
 export async function searchAllProviders(query, { libraryFoods }) {
-  const [library, nutritionix] = await Promise.all([
+  const [library, nutritionix, usda, off] = await Promise.all([
     Promise.resolve(libraryProvider.search(query, libraryFoods)),
     nutritionixProvider.search(query),
+    usdaProvider.search(query),
+    offProvider.search(query),
   ]);
-  return { library, nutritionix };
+  return { library, nutritionix, usda, off };
+}
+
+// Flat meal composite (v3): sums component macros into one canonical food
+// (source: 'meal') so the rest of the app logs/scales/displays it exactly
+// like any other food — no separate "meal entry" code path. No nesting:
+// a meal's components must be ordinary foods, not other meals.
+export function buildMeal(name, components) {
+  let totalGrams = 0;
+  const totals = components.reduce(
+    (a, c) => {
+      const grams = c.servingGrams * c.quantity;
+      totalGrams += grams;
+      const scale = grams / 100;
+      return {
+        cal: a.cal + c.food.per100.cal * scale,
+        protein: a.protein + c.food.per100.protein * scale,
+        carbs: a.carbs + c.food.per100.carbs * scale,
+        fat: a.fat + c.food.per100.fat * scale,
+      };
+    },
+    { cal: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+  const per100 =
+    totalGrams > 0
+      ? {
+          cal: round((totals.cal * 100) / totalGrams, 1),
+          protein: round((totals.protein * 100) / totalGrams, 1),
+          carbs: round((totals.carbs * 100) / totalGrams, 1),
+          fat: round((totals.fat * 100) / totalGrams, 1),
+        }
+      : { cal: 0, protein: 0, carbs: 0, fat: 0 };
+  return {
+    id: uid(),
+    name,
+    source: "meal",
+    brand: null,
+    per100,
+    servings: [{ label: "1 meal", grams: round(totalGrams, 1) }],
+    provenance: "user_created",
+    verified: false,
+    createdAt: todayStr(),
+    components: components.map((c) => ({
+      foodId: c.food.id,
+      name: c.food.name,
+      servingLabel: c.servingLabel,
+      servingGrams: c.servingGrams,
+      quantity: c.quantity,
+    })),
+  };
 }
 
 // Cache-on-first-use: persists a canonical copy of an external food into the

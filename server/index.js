@@ -10,8 +10,9 @@ import "dotenv/config";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, "..", "dist");
 
-const { NUTRITIONIX_APP_ID, NUTRITIONIX_API_KEY, PORT = 8787 } = process.env;
+const { NUTRITIONIX_APP_ID, NUTRITIONIX_API_KEY, USDA_API_KEY, PORT = 8787 } = process.env;
 const configured = Boolean(NUTRITIONIX_APP_ID && NUTRITIONIX_API_KEY);
+const usdaConfigured = Boolean(USDA_API_KEY);
 
 const app = express();
 app.use(cors());
@@ -21,6 +22,11 @@ if (!configured) {
   console.warn(
     "[nutritionix-proxy] NUTRITIONIX_APP_ID / NUTRITIONIX_API_KEY not set — " +
       "/api/nutritionix/* will return 503 until they're added to .env (see .env.example)."
+  );
+}
+if (!usdaConfigured) {
+  console.warn(
+    "[usda-proxy] USDA_API_KEY not set — /api/usda/* will return 503 until it's added to .env (see .env.example)."
   );
 }
 
@@ -58,6 +64,23 @@ app.post("/api/nutritionix/nutrients", async (req, res) => {
       headers: nixHeaders(),
       body: JSON.stringify({ query }),
     });
+    if (!r.ok) return res.status(r.status).json({ error: "upstream_error", foods: [] });
+    const data = await r.json();
+    res.json({ foods: data.foods || [] });
+  } catch (e) {
+    res.status(502).json({ error: "proxy_fetch_failed", foods: [] });
+  }
+});
+
+// USDA FoodData Central search — nutrients come back per-100g directly, no
+// follow-up "detail" call needed (unlike Nutritionix's common foods).
+app.get("/api/usda/search", async (req, res) => {
+  const query = String(req.query.query || "").trim();
+  if (!query) return res.json({ foods: [] });
+  if (!usdaConfigured) return res.status(503).json({ error: "not_configured", foods: [] });
+  try {
+    const url = `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${encodeURIComponent(USDA_API_KEY)}&query=${encodeURIComponent(query)}&pageSize=10`;
+    const r = await fetch(url);
     if (!r.ok) return res.status(r.status).json({ error: "upstream_error", foods: [] });
     const data = await r.json();
     res.json({ foods: data.foods || [] });
