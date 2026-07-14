@@ -2,6 +2,8 @@ import React, { useState, useEffect, useMemo } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
+import { todayStr, uid, round } from "./lib/helpers.js";
+import { searchAllProviders, nutritionixProvider, cacheExternalFood } from "./nutrition/foodProviders.js";
 
 /* ----------------------------- helpers ----------------------------- */
 
@@ -10,14 +12,6 @@ const V2_KEY = "training-log:v2";
 const V1_KEY = "training-log:v1";
 const KG_PER_LB = 0.45359237;
 const KM_PER_MI = 1.609344;
-
-const todayStr = () => {
-  const d = new Date();
-  const off = d.getTimezoneOffset();
-  return new Date(d.getTime() - off * 60000).toISOString().slice(0, 10);
-};
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const round = (n, p = 1) => { const f = 10 ** p; return Math.round(n * f) / f; };
 
 const toKg = (v, sys) => (sys === "imperial" ? v * KG_PER_LB : v);
 const fromKg = (v, sys) => (sys === "imperial" ? v / KG_PER_LB : v);
@@ -72,6 +66,7 @@ const TYPES = {
 
 // Newest first. Every change to the app gets an entry here.
 const CHANGELOG = [
+  { date: "Jul 14, 2026", page: "Nutrition", summary: "Shipped food logging v2: search now fans out to Nutritionix (branded + generic foods) alongside your personal library, behind a shared provider interface so both sources return the same canonical food shape and neither is ranked or hidden — each result is tagged by origin. The Nutritionix API key stays server-side behind a small proxy (never shipped to the browser); until a key is configured, search behaves exactly as v1 (library only, no errors shown). Selecting an external result and logging it caches a canonical copy into your library on first use (flagged “cached_from_api”), so it's searchable offline afterward and duplicate cached copies are avoided." },
   { date: "Jul 14, 2026", page: "Platform", summary: "Rebuilt as a standalone Vite + React website: added the project scaffold (package.json, vite.config.js, index.html), a localStorage-backed polyfill for the window.storage API this app persists through, and moved Google Fonts loading from an in-CSS @import to a <link> tag in index.html for more reliable loading." },
   { date: "Jun 27, 2026", page: "Nutrition", summary: "Shipped food logging v1: personal food library, custom foods and quick-add, and food-by-food daily logging with serving-size scaling. A day's calories and macros are now summed from logged foods; history shows daily totals that tap to expand into individual foods. Bodyweight stays a separate daily field; older manually-typed days are preserved and flagged \u201cmanual.\u201d" },
   { date: "Jun 27, 2026", page: "Setup", summary: "Added an in-app Food Logging Setup form (in the menu) to capture the v1 decision points, assumptions, and notes; answers save on-device with a copy-to-share summary." },
@@ -142,6 +137,11 @@ export default function WorkoutTracker() {
   const [logServ, setLogServ] = useState(0);
   const [logQty, setLogQty] = useState("1");
   const [editingDiet, setEditingDiet] = useState(null);
+  // nutrition v2: multi-source search (personal library + Nutritionix)
+  const [libResults, setLibResults] = useState([]);
+  const [extResults, setExtResults] = useState([]);
+  const [extSearching, setExtSearching] = useState(false);
+  const [extResolvingId, setExtResolvingId] = useState(null);
   const [qName, setQName] = useState(""); const [qCal, setQCal] = useState("");
   const [qProt, setQProt] = useState(""); const [qCarb, setQCarb] = useState(""); const [qFat, setQFat] = useState("");
   const [cfName, setCfName] = useState(""); const [cfBrand, setCfBrand] = useState("");
@@ -404,14 +404,23 @@ export default function WorkoutTracker() {
   const doLog = () => {
     const q = parseFloat(logQty);
     if (!(q > 0)) return setErr("Enter a quantity greater than 0.");
-    const servs = foodServings(logFood);
+    // Cache-on-first-use: the first time an external result is actually
+    // logged, persist a canonical copy into the personal library.
+    let food = logFood;
+    if (food.source !== "library") {
+      const { food: cached, isNew } = cacheExternalFood(food, data.foods);
+      if (isNew) setData((d) => ({ ...d, foods: [...d.foods, cached] }));
+      food = cached;
+    }
+    const servs = foodServings(food);
     const s = servs[logServ] || servs[0];
-    logEntry(logFood, s.label, s.grams, q);
+    logEntry(food, s.label, s.grams, q);
     closePanels(); setFoodQuery("");
   };
   const editDiet = (e) => {
     setView("body"); setEditingDiet(e.id); setDate(e.date);
-    setLogFood({ id: e.foodId, name: e.food.name, brand: e.food.brand, per100: e.food.per100, servings: [{ label: e.servingLabel, grams: e.servingGrams }] });
+    setLogFood({ id: e.foodId, name: e.food.name, brand: e.food.brand, per100: e.food.per100,
+      source: "library", servings: [{ label: e.servingLabel, grams: e.servingGrams }] });
     setLogServ(0); setLogQty(String(e.quantity)); setPanel("log"); setErr("");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -447,13 +456,37 @@ export default function WorkoutTracker() {
     setEditingDiet(null); setLogFood(food); setLogServ(0); setLogQty("1"); setPanel("log"); setErr("");
   };
 
-  const foodResults = useMemo(() => {
-    const q = foodQuery.trim().toLowerCase();
-    const list = q
-      ? data.foods.filter((f) => f.name.toLowerCase().includes(q) || (f.brand || "").toLowerCase().includes(q))
-      : [...data.foods].slice(-8).reverse();
-    return list.slice(0, 20);
-  }, [data.foods, foodQuery]);
+  const recentFoods = useMemo(() => [...data.foods].slice(-8).reverse(), [data.foods]);
+
+  // Debounced fan-out to every enabled provider (personal library +
+  // Nutritionix) via the shared orchestrator — one search call, one debounce.
+  useEffect(() => {
+    const q = foodQuery.trim();
+    if (view !== "body" || !q) { setLibResults([]); setExtResults([]); setExtSearching(false); return; }
+    let live = true;
+    setExtSearching(true);
+    const t = setTimeout(() => {
+      searchAllProviders(q, { libraryFoods: data.foods }).then(({ library, nutritionix }) => {
+        if (live) { setLibResults(library.slice(0, 20)); setExtResults(nutritionix); setExtSearching(false); }
+      });
+    }, 280);
+    return () => { live = false; clearTimeout(t); };
+  }, [foodQuery, data.foods, view]);
+
+  const foodResults = foodQuery.trim() ? libResults : recentFoods;
+
+  const selectFood = async (f) => {
+    if (!f._needsDetail) { openLog(f); return; }
+    setExtResolvingId(f.id);
+    try {
+      const resolved = await nutritionixProvider.getDetail(f);
+      openLog(resolved);
+    } catch (e) {
+      setErr(e.message || "Couldn't load nutrition info for that food.");
+    } finally {
+      setExtResolvingId(null);
+    }
+  };
 
   const showWeight = (kg) => round(fromKg(kg, system), 1);
   const showDist = (km) => (km == null ? null : round(fromKm(km, system), 2));
@@ -994,17 +1027,30 @@ export default function WorkoutTracker() {
         {/* add food */}
         <section className="tl-card tl-form">
           <div className="tl-setup-qlabel"><b>Add food</b></div>
-          <input className="tl-foodsearch" placeholder="Search your foods…" value={foodQuery}
+          <input className="tl-foodsearch" placeholder="Search your foods and Nutritionix…" value={foodQuery}
             onChange={(e) => setFoodQuery(e.target.value)} />
           <div className="tl-foodlist">
-            {foodResults.length === 0 ? (
-              <div className="tl-nut-none">{foodQuery ? "No matches in your library." : "Your library is empty — quick-add or create a food below."}</div>
-            ) : foodResults.map((f) => (
+            {foodResults.map((f) => (
               <button key={f.id} className="tl-foodrow" onClick={() => openLog(f)}>
                 <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
                 <span className="tl-foodmeta">{Math.round(f.per100.cal)} kcal/100g<span className="tl-foodtag">Your library</span></span>
               </button>
             ))}
+            {extResults.map((f) => (
+              <button key={f.id} className="tl-foodrow" onClick={() => selectFood(f)} disabled={extResolvingId === f.id}>
+                <span className="tl-foodname">{f.name}{f.brand ? <span className="tl-foodbrand"> · {f.brand}</span> : null}</span>
+                <span className="tl-foodmeta">
+                  {f._needsDetail ? (extResolvingId === f.id ? "Loading…" : "Tap for nutrition info") : `${Math.round(f.per100.cal)} kcal/100g`}
+                  <span className="tl-foodtag tl-foodtag-nix">Nutritionix</span>
+                </span>
+              </button>
+            ))}
+            {extSearching && <div className="tl-nut-none">Searching Nutritionix…</div>}
+            {!extSearching && foodResults.length === 0 && extResults.length === 0 && (
+              <div className="tl-nut-none">
+                {foodQuery ? "No matches. Quick-add or create a custom food below." : "Your library is empty — quick-add or create a food below."}
+              </div>
+            )}
           </div>
           <div className="tl-foodbtns">
             <button className={"tl-chipbtn" + (panel === "quick" ? " on" : "")} onClick={() => { closePanels(); setQName(foodQuery); setPanel("quick"); }}>+ Quick add</button>
@@ -1306,6 +1352,8 @@ const CSS = `
 .tl-foodbrand{font-weight:400;color:var(--steel);}
 .tl-foodmeta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--steel);font-variant-numeric:tabular-nums;}
 .tl-foodtag{font-family:'Archivo';font-weight:700;font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--body);background:#e7f4ef;padding:2px 6px;}
+.tl-foodtag-nix{color:#6A4FB3;background:#f1edfa;}
+.tl-foodrow:disabled{opacity:.6;cursor:default;}
 .tl-foodbtns{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
 .tl-chipbtn{background:none;border:1.5px solid var(--body);color:var(--body);font-family:'Archivo';font-weight:700;font-size:13px;padding:8px 14px;cursor:pointer;border-radius:0;}
 .tl-chipbtn:hover{background:#eef7f3;}
